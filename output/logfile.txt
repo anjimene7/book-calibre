@@ -1,0 +1,57 @@
+
+
+Processing Histoire du Chevalier d'Iberville (1322)
+title: Histoire du Chevalier d'Iberville
+subject: Historique
+language: french
+author: Adam Charles Gustave Desmazures
+full length: 53534
+unique length: 4185
+
+
+Processing Les Templiers. Une Chevalerie Chret (993)
+title: Les Templiers. Une Chevalerie Chrétienne Au Moyen Age
+subject: Histoire,Templiers
+language: french
+author: Alain Demurger
+Problem with book!: Alain Demurger, Les Templiers. Une Chevalerie C - Alain Demurger.epub
+full length: 0
+unique length: 0
+
+
+Processing Le Livre d'Or d'Alain Doremieux (497)
+title: Le Livre d’Or d'Alain Dorémieux
+subject: Science-Fiction
+language: french
+author: Alain Doremieux
+full length: 48958
+unique length: 6788
+
+
+Processing The World Without Us (415)
+title: The World Without Us
+subject: Fiction
+language: english
+author: Alan Weiseman
+full length: 0
+unique length: 0
+
+
+Processing Diamond Dogs, Turquoise Days (339)
+title: Diamond Dogs, Turquoise Days
+subject: Science-Fiction
+language: french
+author: Alastair Reynolds
+full length: 41065
+unique length: 5399
+
+
+Processing L'Arche De La Redemption (342)
+title: L'Arche De La Rédemption
+subject: Science-Fiction
+language: french
+author: Alastair Reynolds
+full length: 149853
+unique length: 9150
+
+elapsed time: 337.83
