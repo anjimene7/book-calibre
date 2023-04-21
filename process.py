@@ -1,94 +1,19 @@
-import textract, os, sys
+import textract, os
 import numpy as np
 import pandas as pd
 import re
 import pickle
 import iso639
-import time
 import argparse
 import logging
 from collections import Counter, OrderedDict
 from xml.etree import ElementTree as ET
 from typing import List, Dict, Tuple
+import multiprocessing as mp
+import itertools
+from sklearn.feature_extraction.text import TfidfTransformer
 
-class Application:
-    def __init__(self, data_path: str, sample: int = -1):
-        self.data_path = data_path
-        self.authors = [x for x in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, x))]
-        logging.debug(f"Detected authors: {sorted(self.authors)}")
-        if not self.authors:
-            logging.warning(f"No books detected")
-        else:
-            self.files: List[str] = []
-            for root, dirs, files in os.walk(self.data_path):
-                for file in files:
-                    if file.endswith('.epub'):
-                        self.files.append(os.path.join(root, file))
-            if sample > 0:
-                self.files = self.files[0:sample]
-            self.books = [Book(path=x) for x in self.files]
-
-
-    def refine_dict(df, lang='french'):
-        # 1) Drops comic books (BD), or Audiobooks,
-        # 2) drops books based on the language,
-        # 3) drops books based on whether it could detect words or not
-        # Only keep books for specific language, 'fra' by default since most of the books I have are in French
-
-        ######  1) REMOVE AUDIOBOOKS OR COMIC BOOKS
-        rows_to_remove = df['metadata'].index[np.where((df['metadata']['subject'] == 'Audiobook') |
-                                                       (df['metadata']['subject'] == 'BD'))[0]]
-        for i in df.keys():
-            df[i].drop(rows_to_remove, axis=0, inplace=True)
-        #######  2) LANGUAGE
-        rows_to_remove = df['metadata'].index[np.where(df['metadata']['language'] != lang)[0]]
-        for i in df.keys():
-            df[i].drop(rows_to_remove, axis=0, inplace=True)
-        #######  3) BOOKS WITH NOT ENOUGH WORDS
-        # how to know whether a book has not enough words? Most of the books are epub format, words can be easily scrapped,
-        # some books are pdf and the textract process does not necesarily extract them.
-        # As such we will remove them as a first naive approach. Effectively, this means removing boosk with length_full of 0
-        # up to 900
-        rows_to_remove = df['metadata'].index[np.where(df['metadata']['length_full'] < 900)[0]]
-        for i in df.keys():
-            df[i].drop(rows_to_remove, axis=0, inplace=True)
-
-        #####  4) NOW WE WILL REMOVE THE WORDS THAT ARE NUMBERS (The probably are page numbers, or others. We dont need them)
-        # We will for instance remove '112' or '12-13' but not 'paris12', which we will keep stripping the numbers
-        cols_to_remove = [x for x in df['words'].columns if re.findall(r'^[^a-z]*[0-9]+[^a-z]*$', x)]
-        df['words'].drop(cols_to_remove, axis=1, inplace=True)
-        # Now strip numbers from column names
-        cols_to_rename = [re.sub(r'[\d]+', '', x) for x in df['words'].columns]
-        df['words'].columns = cols_to_rename
-
-        ####  5) REMOVE COLUMNS WITH ONLY NANS IN THE WORDS DF
-        cols_to_remove = [x for (x, v) in zip(df['words'].columns, df['words'].isna().all(axis=1)) if v]
-        df['words'].drop(cols_to_remove, axis=1, inplace=True)
-
-        ####  6) REMOVE COLUMNS WITH WORDS WITH LEN <= 2 --> NOT REAL WORDS
-        cols_to_remove = [x for x in df['words'].columns if len(x) <= 2]
-        df['words'].drop(cols_to_remove, axis=1, inplace=True)
-
-        ####  7) FILL NAN values with 0
-        df['words'].fillna(0, inplace=True)
-
-        ####  8) MERGE COLUMNS WITH THE SAME NAME --> SINCE THEY HAVE BEEN LEMATIZED
-        df['words'] = df['words'].groupby(level=0, axis=1).sum()
-
-    def compute_IDF(df):
-        # DF is a PD dataframe with rows as documents, and columns as tokens
-        from sklearn.feature_extraction.text import TfidfTransformer
-        tfidf_transformer = TfidfTransformer(smooth_idf=True, use_idf=True)
-        tfidf_transformer.fit(df)
-        # df_idf = pd.DataFrame(tfidf_transformer.idf_,index=df.columns, columns=["tf_idf_weights"])
-        return tfidf_transformer.idf_
-
-    def compute_TF(df):
-        # DF is a PD dataframe with rows as documents, and columns as tokens
-        return df.div(df.sum(axis=1), axis=0)
-
-
-class Book:
+class Book():
     def __init__(self, path: str, method='lemmatization', stopwords='spacy'):
         """
         Class constructor
@@ -189,6 +114,135 @@ class Book:
 
         return text, final, length_book_unique, length_book_full
 
+class Application:
+    def __init__(self, data_path: str, books_cache_path: str, parallel_pool: int, sample: int = -1, reset_cache: bool = False):
+        self.data_path = data_path
+        self.books_cache_path = books_cache_path
+        self.parallel_pool = parallel_pool
+        if reset_cache:
+            self._reset_cache()
+        self.authors = [x for x in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, x))]
+        logging.debug(f"Detected authors: {sorted(self.authors)}")
+        if not self.authors:
+            logging.warning(f"No books detected")
+        else:
+            self.files: List[str] = []
+            for root, dirs, files in os.walk(self.data_path):
+                for file in files:
+                    if file.endswith('.epub') and os.path.join(root, file) not in self.files:
+                        self.files.append(os.path.join(root, file))
+            if sample > 0:
+                self.files = self.files[0:sample]
+                logging.info(f"Selecting only a subset of files (n={len(self.files)})")
+            self.books: List[Book] = self._instantiate_books()
+            #self._compute_IDF()
+
+    def __str__(self) -> str:
+        """
+        Returns the representation of the application when the object is printed
+        """
+        return f"Number of books: {len(self.books)}, Data path: {self.data_path}, Cache path: {self.books_cache_path}"
+
+    def _reset_cache(self) -> None:
+        """
+        Removes all pickle files from the cache folder
+        """
+        logging.info(f"Resetting cache: Will remove all pickle files under {self.books_cache_path}")
+        for file in os.listdir(self.books_cache_path):
+            os.remove(os.path.join(self.books_cache_path, file))
+
+    @classmethod
+    def _process_book(cls, file: str, books_cache_path: str):
+        pickle_file = "".join([s.lower().replace(' ', '_') for s in os.path.basename(file) if s.isalnum() or s.isspace()]) + '.pickle'
+        pickle_file_path = os.path.join(books_cache_path, pickle_file)
+        if os.path.exists(pickle_file_path):
+            logging.debug(f"Pickle file exists for {file}, will load it from there")
+            with open(pickle_file_path, 'rb') as f:
+                book = pickle.load(f)
+        else:
+            book = Book(path=file)
+            logging.debug(f"Dumping file into {pickle_file_path}")
+            with open(pickle_file_path, 'wb') as f:
+                pickle.dump(book, f)
+        return book
+
+    def _instantiate_books(self) -> List[Book]:
+        """
+        This method will instantiate all Books objects for the selected sample. It will load from the cache in case
+        it has already been processed before
+        """
+        logging.debug(f"Will instantiate books with a pool of {self.parallel_pool}")
+        if not os.path.isdir(self.books_cache_path):
+            logging.info(f"Creating books cache dir at {self.books_cache_path}")
+            os.mkdir(self.books_cache_path)
+
+        with mp.Pool(self.parallel_pool) as pool:
+            books = pool.starmap(self._process_book, zip(self.files, itertools.repeat(self.books_cache_path)))
+        return books
+
+    def _compute_IDF(self):
+        # DF is a PD dataframe with rows as documents, and columns as tokens
+        df = pd.DataFrame({'words': [x.final for x in self.books]}, index=[x.title[0] for x in self.books])
+        df = pd.json_normalize(df['words'])
+        tfidf_transformer = TfidfTransformer(smooth_idf=True, use_idf=True)
+        tfidf_transformer.fit(df)
+        # df_idf = pd.DataFrame(tfidf_transformer.idf_,index=df.columns, columns=["tf_idf_weights"])
+        return tfidf_transformer.idf_
+
+    def _compute_TF(self):
+        # DF is a PD dataframe with rows as documents, and columns as tokens
+        return df.div(df.sum(axis=1), axis=0)
+
+
+
+
+
+    def refine_dict(df, lang='french'):
+        # 1) Drops comic books (BD), or Audiobooks,
+        # 2) drops books based on the language,
+        # 3) drops books based on whether it could detect words or not
+        # Only keep books for specific language, 'fra' by default since most of the books I have are in French
+
+        ######  1) REMOVE AUDIOBOOKS OR COMIC BOOKS
+        rows_to_remove = df['metadata'].index[np.where((df['metadata']['subject'] == 'Audiobook') |
+                                                       (df['metadata']['subject'] == 'BD'))[0]]
+        for i in df.keys():
+            df[i].drop(rows_to_remove, axis=0, inplace=True)
+        #######  2) LANGUAGE
+        rows_to_remove = df['metadata'].index[np.where(df['metadata']['language'] != lang)[0]]
+        for i in df.keys():
+            df[i].drop(rows_to_remove, axis=0, inplace=True)
+        #######  3) BOOKS WITH NOT ENOUGH WORDS
+        # how to know whether a book has not enough words? Most of the books are epub format, words can be easily scrapped,
+        # some books are pdf and the textract process does not necesarily extract them.
+        # As such we will remove them as a first naive approach. Effectively, this means removing books with length_full of 0
+        # up to 900
+        rows_to_remove = df['metadata'].index[np.where(df['metadata']['length_full'] < 900)[0]]
+        for i in df.keys():
+            df[i].drop(rows_to_remove, axis=0, inplace=True)
+
+        #####  4) NOW WE WILL REMOVE THE WORDS THAT ARE NUMBERS (The probably are page numbers, or others. We dont need them)
+        # We will for instance remove '112' or '12-13' but not 'paris12', which we will keep stripping the numbers
+        cols_to_remove = [x for x in df['words'].columns if re.findall(r'^[^a-z]*[0-9]+[^a-z]*$', x)]
+        df['words'].drop(cols_to_remove, axis=1, inplace=True)
+        # Now strip numbers from column names
+        cols_to_rename = [re.sub(r'[\d]+', '', x) for x in df['words'].columns]
+        df['words'].columns = cols_to_rename
+
+        ####  5) REMOVE COLUMNS WITH ONLY NANS IN THE WORDS DF
+        cols_to_remove = [x for (x, v) in zip(df['words'].columns, df['words'].isna().all(axis=1)) if v]
+        df['words'].drop(cols_to_remove, axis=1, inplace=True)
+
+        ####  6) REMOVE COLUMNS WITH WORDS WITH LEN <= 2 --> NOT REAL WORDS
+        cols_to_remove = [x for x in df['words'].columns if len(x) <= 2]
+        df['words'].drop(cols_to_remove, axis=1, inplace=True)
+
+        ####  7) FILL NAN values with 0
+        df['words'].fillna(0, inplace=True)
+
+        ####  8) MERGE COLUMNS WITH THE SAME NAME --> SINCE THEY HAVE BEEN LEMATIZED
+        df['words'] = df['words'].groupby(level=0, axis=1).sum()
+
 
 def main_process(verbose, method, stopWords, ebookPath, outputPath):
     # MAIN LOOP
@@ -196,35 +250,6 @@ def main_process(verbose, method, stopWords, ebookPath, outputPath):
     metadata_dict = dict()
     words_list = []
 
-    
-    t = time.time()
-    orig_stdout = sys.stdout
-    f = open(os.path.join(outputPath,'logfile.txt'), 'w')
-    sys.stdout = f
-    for author in tqdm(authors):
-        books = os.listdir("/".join([path,author]))
-        for book in books:
-            print("")
-            metadata = dict()
-            final = []
-            final, metadata = process_book(path, author, book, verbose=verbose, method=method, stopwords=stopWords)
-            if(counter == 5):
-                break
-            counter = counter + 1
-            if(counter == 1):
-                metadata_dict = metadata
-            else:
-                for x in metadata_dict.keys():
-                    metadata_dict[x].extend(metadata[x])
-            words_list.append(final)
-        else:
-            continue
-        break
-    elapsed = time.time() - t
-    print("\nelapsed time: " + str(np.round(elapsed,2)))
-    sys.stdout = orig_stdout
-    f.close()
-    
     metadata = pd.DataFrame(metadata_dict, index=metadata_dict['title'])
     words = pd.DataFrame(words_list, index=metadata_dict['title'])
     final = {'metadata':metadata, 'words':words}
@@ -247,6 +272,7 @@ def main_process(verbose, method, stopWords, ebookPath, outputPath):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument("path", help="path where data is located", action="store")
     parser.add_argument("-l", "--log_level", help="Log level [DEBUG, INFO, WARNING, ERROR, CRITICAL]",
                         default="INFO", action="store")
     args = parser.parse_args()
@@ -254,5 +280,5 @@ if __name__ == '__main__':
     log_level = getattr(logging, args.log_level)
     logging.basicConfig(level=log_level, format=format)
 
-    app = Application(data_path='test_files', sample=2)
-    book = Book(path='test_files/Aldous Huxley/Le Meilleur Des Mondes (72)/Le Meilleur Des Mondes - Aldous Huxley.epub')
+    app = Application(data_path=args.path, books_cache_path='cache', parallel_pool=1, sample=9)
+    print('hey')
